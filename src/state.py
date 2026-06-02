@@ -1,12 +1,13 @@
 """
 State management — single source of truth lives on HuggingFace.
 Reads on startup, writes every 50 examples, writes on clean exit.
+Uses new HuggingFace Hub API.
 """
 
 import json
 import os
 import time
-import requests
+import tempfile
 from datetime import datetime, timezone
 from taxonomy import INTENT_CLASSES, TARGET_PER_CLASS
 
@@ -14,27 +15,29 @@ HF_TOKEN = os.environ["HF_TOKEN"]
 HF_USERNAME = "rufatronics"
 HF_DATASET_REPO = f"{HF_USERNAME}/ueg-training-data"
 STATE_FILE = "progress.json"
-HF_API = "https://huggingface.co/api"
-HF_RAW = f"https://huggingface.co/datasets/{HF_DATASET_REPO}/resolve/main"
-
-
-def _hf_headers():
-    return {"Authorization": f"Bearer {HF_TOKEN}"}
 
 
 def load_state() -> dict:
     """Load progress state from HuggingFace. Returns fresh state if not found."""
     try:
-        r = requests.get(f"{HF_RAW}/{STATE_FILE}", headers=_hf_headers(), timeout=30)
-        if r.status_code == 200:
-            state = r.json()
-            print(f"[STATE] Loaded — {sum(state['class_counts'].values())} total examples so far")
-            return state
-        else:
-            print(f"[STATE] No existing state found (HTTP {r.status_code}), starting fresh")
-            return _fresh_state()
+        from huggingface_hub import hf_hub_download
+        
+        local_path = hf_hub_download(
+            repo_id=HF_DATASET_REPO,
+            filename=STATE_FILE,
+            repo_type="dataset",
+            token=HF_TOKEN,
+            local_files_only=False
+        )
+        
+        with open(local_path, 'r', encoding='utf-8') as f:
+            state = json.load(f)
+        
+        total = sum(state['class_counts'].values())
+        print(f"[STATE] Loaded — {total} total examples so far")
+        return state
     except Exception as e:
-        print(f"[STATE] Error loading state: {e} — starting fresh")
+        print(f"[STATE] No existing state found ({e}) — starting fresh")
         return _fresh_state()
 
 
@@ -48,13 +51,11 @@ def _fresh_state() -> dict:
         "class_complete": {str(k): False for k in INTENT_CLASSES.keys()},
         "daily_usage": {
             "date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-            "groq": {m: 0 for m in ["llama-3.3-70b-versatile", "llama-3.1-8b-instant",
-                                      "deepseek-r1-distill-llama-70b", "qwen-qwq-32b"]},
+            "groq": {m: 0 for m in ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "meta-llama/llama-4-scout-17b-16e-instruct"]},
             "gemini_flash_lite": 0,
             "gemini_flash": 0,
             "gemini_pro": 0,
             "mistral": 0,
-            "openrouter": 0,
         },
         "total_generated": 0,
         "total_discarded": 0,
@@ -75,51 +76,31 @@ def save_state(state: dict) -> bool:
         state["completed_at"] = datetime.now(timezone.utc).isoformat()
 
     content = json.dumps(state, indent=2)
-    encoded = content.encode("utf-8")
-    import base64
-    b64 = base64.b64encode(encoded).decode("utf-8")
 
-    # Get current SHA if file exists (needed for update)
-    sha = _get_file_sha(STATE_FILE)
-
-    payload = {
-        "message": f"Update progress: {state['total_generated']} examples",
-        "content": b64,
-    }
-    if sha:
-        payload["sha"] = sha
-
-    url = f"https://huggingface.co/api/datasets/{HF_DATASET_REPO}/upload/{STATE_FILE}"
-
-    for attempt in range(3):
-        try:
-            r = requests.post(url, headers=_hf_headers(), json=payload, timeout=30)
-            if r.status_code in (200, 201):
-                print(f"[STATE] Saved — {state['total_generated']} total, {sum(1 for v in state['class_complete'].values() if v)} classes complete")
-                return True
-            else:
-                print(f"[STATE] Save attempt {attempt+1} failed: HTTP {r.status_code} — {r.text[:200]}")
-                time.sleep(5)
-        except Exception as e:
-            print(f"[STATE] Save attempt {attempt+1} exception: {e}")
-            time.sleep(5)
-
-    print("[STATE] CRITICAL: Failed to save state after 3 attempts")
-    return False
-
-
-def _get_file_sha(filename: str) -> str | None:
-    """Get SHA of existing file on HF (needed for updates)."""
     try:
-        url = f"https://huggingface.co/api/datasets/{HF_DATASET_REPO}/tree/main"
-        r = requests.get(url, headers=_hf_headers(), timeout=15)
-        if r.status_code == 200:
-            for f in r.json():
-                if f.get("path") == filename:
-                    return f.get("oid")
-    except Exception:
-        pass
-    return None
+        from huggingface_hub import HfApi
+        api = HfApi(token=HF_TOKEN)
+        
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.json', encoding='utf-8') as tmp:
+            tmp.write(content)
+            tmp_path = tmp.name
+
+        api.upload_file(
+            path_or_fileobj=tmp_path,
+            path_in_repo=STATE_FILE,
+            repo_id=HF_DATASET_REPO,
+            repo_type="dataset",
+            token=HF_TOKEN,
+            commit_message=f"Update progress: {state['total_generated']} examples"
+        )
+        
+        os.unlink(tmp_path)
+        print(f"[STATE] Saved — {state['total_generated']} total, {sum(1 for v in state['class_complete'].values() if v)} classes complete")
+        return True
+
+    except Exception as e:
+        print(f"[STATE] CRITICAL: Failed to save state — {e}")
+        return False
 
 
 def reset_daily_usage_if_new_day(state: dict) -> dict:
@@ -129,13 +110,11 @@ def reset_daily_usage_if_new_day(state: dict) -> dict:
         print(f"[STATE] New day {today} — resetting daily usage counters")
         state["daily_usage"] = {
             "date": today,
-            "groq": {m: 0 for m in ["llama-3.3-70b-versatile", "llama-3.1-8b-instant",
-                                      "deepseek-r1-distill-llama-70b", "qwen-qwq-32b"]},
+            "groq": {m: 0 for m in ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "meta-llama/llama-4-scout-17b-16e-instruct"]},
             "gemini_flash_lite": 0,
             "gemini_flash": 0,
             "gemini_pro": 0,
             "mistral": 0,
-            "openrouter": 0,
         }
     return state
 

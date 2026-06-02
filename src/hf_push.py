@@ -2,6 +2,7 @@
 HuggingFace dataset pusher.
 One JSONL file per class: data/class_01_noise_gibberish.jsonl etc.
 Appends to existing files — never overwrites.
+Uses new /commit/ endpoint (old /upload/ is deprecated).
 """
 
 import os
@@ -10,17 +11,14 @@ import time
 import base64
 import requests
 from typing import Optional
+from huggingface_hub import CommitScheduler, CommitOperationAdd
+import tempfile
 
 HF_TOKEN    = os.environ["HF_TOKEN"]
 HF_USERNAME = "rufatronics"
 HF_REPO     = f"{HF_USERNAME}/ueg-training-data"
-HF_API_BASE = f"https://huggingface.co/api/datasets/{HF_REPO}"
 
 from taxonomy import INTENT_CLASSES
-
-
-def _headers():
-    return {"Authorization": f"Bearer {HF_TOKEN}", "Content-Type": "application/json"}
 
 
 def _class_filename(class_id: int) -> str:
@@ -28,33 +26,10 @@ def _class_filename(class_id: int) -> str:
     return f"data/class_{class_id:02d}_{label}.jsonl"
 
 
-def _get_file_info(path: str) -> tuple[Optional[str], Optional[str]]:
-    """Returns (current_content_b64, sha) or (None, None) if file doesn't exist."""
-    try:
-        url = f"https://huggingface.co/datasets/{HF_REPO}/resolve/main/{path}"
-        r = requests.get(url, headers={"Authorization": f"Bearer {HF_TOKEN}"}, timeout=30)
-        if r.status_code == 200:
-            existing = r.text
-
-            # Get SHA for update
-            tree_url = f"{HF_API_BASE}/tree/main/data"
-            tr = requests.get(tree_url, headers=_headers(), timeout=15)
-            sha = None
-            if tr.status_code == 200:
-                for f in tr.json():
-                    if f.get("path") == path:
-                        sha = f.get("oid")
-                        break
-            return existing, sha
-        return None, None
-    except Exception as e:
-        print(f"[HF] Error getting file info for {path}: {e}")
-        return None, None
-
-
 def push_examples(class_id: int, examples: list[dict]) -> bool:
     """
     Append new examples to the class JSONL file on HuggingFace.
+    Uses huggingface_hub library for reliable uploads.
     Creates the file if it doesn't exist.
     Returns True on success.
     """
@@ -63,50 +38,51 @@ def push_examples(class_id: int, examples: list[dict]) -> bool:
 
     path = _class_filename(class_id)
 
-    # Build new lines
-    new_lines = ""
-    for ex in examples:
-        new_lines += json.dumps(ex, ensure_ascii=False) + "\n"
+    try:
+        from huggingface_hub import HfApi
+        api = HfApi(token=HF_TOKEN)
+        
+        # Build new lines
+        new_content = ""
+        for ex in examples:
+            new_content += json.dumps(ex, ensure_ascii=False) + "\n"
 
-    # Fetch existing content
-    existing_content, sha = _get_file_info(path)
-
-    if existing_content is not None:
-        full_content = existing_content + new_lines
-    else:
-        full_content = new_lines
-
-    # Encode and push
-    encoded = base64.b64encode(full_content.encode("utf-8")).decode("utf-8")
-
-    payload = {
-        "message": f"Add {len(examples)} examples to class {class_id}",
-        "content": encoded,
-    }
-    if sha:
-        payload["sha"] = sha
-
-    url = f"{HF_API_BASE}/upload/{path}"
-
-    for attempt in range(3):
+        # Try to fetch existing content
         try:
-            r = requests.post(url, headers=_headers(), json=payload, timeout=60)
-            if r.status_code in (200, 201):
-                print(f"[HF] ✓ Pushed {len(examples)} examples → {path}")
-                return True
-            elif r.status_code == 429:
-                wait = (2 ** attempt) * 15
-                print(f"[HF] Rate limited — waiting {wait}s")
-                time.sleep(wait)
-            else:
-                print(f"[HF] Push failed attempt {attempt+1}: HTTP {r.status_code} — {r.text[:200]}")
-                time.sleep(10)
-        except Exception as e:
-            print(f"[HF] Push exception attempt {attempt+1}: {e}")
-            time.sleep(10)
+            existing_content = api.hf_hub_download(
+                repo_id=HF_REPO,
+                filename=path,
+                repo_type="dataset",
+                token=HF_TOKEN
+            )
+            with open(existing_content, 'r', encoding='utf-8') as f:
+                full_content = f.read() + new_content
+        except Exception:
+            # File doesn't exist yet
+            full_content = new_content
 
-    print(f"[HF] FAILED to push class {class_id} after 3 attempts")
-    return False
+        # Create temp file with combined content
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.jsonl', encoding='utf-8') as tmp:
+            tmp.write(full_content)
+            tmp_path = tmp.name
+
+        # Upload using new API
+        api.upload_file(
+            path_or_fileobj=tmp_path,
+            path_in_repo=path,
+            repo_id=HF_REPO,
+            repo_type="dataset",
+            token=HF_TOKEN,
+            commit_message=f"Add {len(examples)} examples to class {class_id}"
+        )
+
+        os.unlink(tmp_path)
+        print(f"[HF] ✓ Pushed {len(examples)} examples → {path}")
+        return True
+
+    except Exception as e:
+        print(f"[HF] Push failed for class {class_id}: {e}")
+        return False
 
 
 def push_bulk(batches: dict[int, list[dict]]) -> dict[int, bool]:
@@ -121,22 +97,22 @@ def push_bulk(batches: dict[int, list[dict]]) -> dict[int, bool]:
 
 def ensure_repo_exists():
     """Create the HF dataset repo if it doesn't exist yet."""
-    url = f"https://huggingface.co/api/repos/create"
-    payload = {
-        "type": "dataset",
-        "name": "ueg-training-data",
-        "private": False,
-    }
     try:
-        r = requests.post(url, headers=_headers(), json=payload, timeout=30)
-        if r.status_code in (200, 201):
-            print("[HF] Dataset repo created")
-        elif r.status_code == 409:
+        from huggingface_hub import HfApi
+        api = HfApi(token=HF_TOKEN)
+        try:
+            api.dataset_info(repo_id=HF_REPO, token=HF_TOKEN)
             print("[HF] Dataset repo already exists")
-        else:
-            print(f"[HF] Repo creation: HTTP {r.status_code} — {r.text[:200]}")
+        except Exception:
+            api.create_repo(
+                repo_id=HF_REPO,
+                repo_type="dataset",
+                private=False,
+                token=HF_TOKEN
+            )
+            print("[HF] Dataset repo created")
     except Exception as e:
-        print(f"[HF] Repo creation error: {e}")
+        print(f"[HF] Repo check error: {e}")
 
 
 def push_readme(state: dict):
@@ -159,27 +135,25 @@ def push_readme(state: dict):
         lines.append(f"| {cid} | {info['label']} | {count:,} | {TARGET_PER_CLASS:,} | {done} |\n")
 
     content = "".join(lines)
-    encoded = base64.b64encode(content.encode("utf-8")).decode("utf-8")
-
-    sha = None
-    try:
-        tree_url = f"{HF_API_BASE}/tree/main"
-        tr = requests.get(tree_url, headers=_headers(), timeout=15)
-        if tr.status_code == 200:
-            for f in tr.json():
-                if f.get("path") == "README.md":
-                    sha = f.get("oid")
-    except Exception:
-        pass
-
-    payload = {"message": "Update README progress", "content": encoded}
-    if sha:
-        payload["sha"] = sha
 
     try:
-        r = requests.post(f"{HF_API_BASE}/upload/README.md",
-                          headers=_headers(), json=payload, timeout=30)
-        if r.status_code in (200, 201):
-            print("[HF] README updated")
+        from huggingface_hub import HfApi
+        api = HfApi(token=HF_TOKEN)
+        
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.md', encoding='utf-8') as tmp:
+            tmp.write(content)
+            tmp_path = tmp.name
+
+        api.upload_file(
+            path_or_fileobj=tmp_path,
+            path_in_repo="README.md",
+            repo_id=HF_REPO,
+            repo_type="dataset",
+            token=HF_TOKEN,
+            commit_message="Update README progress"
+        )
+        
+        os.unlink(tmp_path)
+        print("[HF] README updated")
     except Exception as e:
         print(f"[HF] README update error: {e}")

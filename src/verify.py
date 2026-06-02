@@ -27,7 +27,8 @@ def verify_batch(raw_response: str, expected_class_id: int) -> tuple[list[dict],
     try:
         parsed = json.loads(text)
     except json.JSONDecodeError as e:
-        print(f"[VERIFY] JSON parse failed: {e} | First 200 chars: {text[:200]}")
+        print(f"[VERIFY] JSON parse failed: {e}")
+        print(f"[VERIFY] First 300 chars: {text[:300]}")
         return [], 1  # whole batch discarded
 
     # Step 3 — must be a list
@@ -44,7 +45,9 @@ def verify_batch(raw_response: str, expected_class_id: int) -> tuple[list[dict],
             valid.append(result)
         else:
             discarded += 1
-            print(f"[VERIFY] Item {i} discarded: {reason}")
+            # Only print first few failures to avoid spam
+            if discarded <= 3:
+                print(f"[VERIFY] Item {i} discarded: {reason}")
 
     return valid, discarded
 

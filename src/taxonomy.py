@@ -53,11 +53,11 @@ GEMINI_HANDLES_LANGS = ["ha", "sw", "yo", "ig", "zu", "am", "so", "rw", "lg", "f
 TARGET_PER_CLASS = 8000
 
 # Groq models to rotate across (limits tracked per model independently)
+# Current as of June 2026 per https://console.groq.com/docs/deprecations
 GROQ_MODELS = [
-    "llama-3.3-70b-versatile",
-    "llama-3.1-8b-instant",
-    "deepseek-r1-distill-llama-70b",
-    "qwen-qwq-32b",
+    "llama-3.3-70b-versatile",      # Best quality 70B
+    "llama-3.1-8b-instant",          # Fast 8B workhorse
+    "meta-llama/llama-4-scout-17b-16e-instruct",  # Newer Llama 4
 ]
 
 # OpenRouter model for adversarial
@@ -70,7 +70,7 @@ GEMINI_MODELS = {
 }
 
 MISTRAL_MODELS = {
-    "main": "mistral-large-latest",
+    "large": "mistral-large-latest",
     "small": "mistral-small-latest",
 }
 

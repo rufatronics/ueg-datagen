@@ -2,7 +2,7 @@ name: Generate UEG Training Data
 
 on:
   schedule:
-    - cron: "0 */2 * * *"   # every 2 hours
+    - cron: "0 */4 * * *"   # every 4 hours — respects daily API limits
   workflow_dispatch:          # manual trigger anytime
   repository_dispatch:
     types: [resume-generation]
@@ -10,13 +10,13 @@ on:
 jobs:
   generate:
     runs-on: ubuntu-latest
-    timeout-minutes: 100      # hard kill at 100 min — our script exits at 90
+    timeout-minutes: 105      # hard kill at 105min — script exits at 90min
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -35,7 +35,7 @@ jobs:
         id: stopcheck
         run: |
           if [ -f STOP ]; then
-            echo "STOP file found — skipping run"
+            echo "STOP file present — skipping this run"
             echo "stopped=true" >> $GITHUB_OUTPUT
           else
             echo "stopped=false" >> $GITHUB_OUTPUT
@@ -48,10 +48,10 @@ jobs:
           GEMINI_API_KEY:  ${{ secrets.GEMINI_API_KEY }}
           MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
           HF_TOKEN:        ${{ secrets.HF_TOKEN }}
-        run: python src/main.py
-
-      - name: Report completion status
-        if: always()
         run: |
-          echo "Run finished at $(date -u)"
-          echo "Exit code: $?"
+          cd src
+          python main.py
+
+      - name: Summary
+        if: always()
+        run: echo "Finished at $(date -u)"

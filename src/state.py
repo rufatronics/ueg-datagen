@@ -1,145 +1,130 @@
 """
-State management — single source of truth lives on HuggingFace.
-Reads on startup, writes every 50 examples, writes on clean exit.
-Uses new HuggingFace Hub API.
+State management — HuggingFace is the single source of truth.
+Reads on startup, checkpoints every 50 examples, saves on clean exit.
+Recognizes existing progress perfectly — never double-counts, never overwrites.
 """
 
 import json
 import os
-import time
 import tempfile
 from datetime import datetime, timezone
-from taxonomy import INTENT_CLASSES, TARGET_PER_CLASS
+from taxonomy import INTENT_CLASSES, TARGET_PER_CLASS, GROQ_MODELS, GROQ_RPD, GEMINI_MODELS, GEMINI_RPD
 
-HF_TOKEN = os.environ["HF_TOKEN"]
-HF_USERNAME = "rufatronics"
-HF_DATASET_REPO = f"{HF_USERNAME}/ueg-training-data"
-STATE_FILE = "progress.json"
+HF_TOKEN    = os.environ["HF_TOKEN"]
+HF_REPO     = "rufatronics/ueg-training-data"
+STATE_FILE  = "progress.json"
 
+
+# ---------------------------------------------------------------------------
+# Load / Save
+# ---------------------------------------------------------------------------
 
 def load_state() -> dict:
-    """Load progress state from HuggingFace. Returns fresh state if not found."""
+    """Load state from HuggingFace. Returns fresh state if not found."""
     try:
         from huggingface_hub import hf_hub_download
-        
-        local_path = hf_hub_download(
-            repo_id=HF_DATASET_REPO,
+        path = hf_hub_download(
+            repo_id=HF_REPO,
             filename=STATE_FILE,
             repo_type="dataset",
             token=HF_TOKEN,
-            local_files_only=False
+            force_download=True,   # always get latest, not cached
         )
-        
-        with open(local_path, 'r', encoding='utf-8') as f:
+        with open(path, "r", encoding="utf-8") as f:
             state = json.load(f)
-        
-        total = sum(state['class_counts'].values())
-        print(f"[STATE] Loaded — {total} total examples so far")
+
+        # Migrate old state schema if needed
+        state = _migrate_state(state)
+
+        total = state["total_generated"]
+        done  = sum(1 for v in state["class_complete"].values() if v)
+        print(f"[STATE] Loaded — {total:,} total examples, {done}/22 classes complete")
         return state
+
     except Exception as e:
-        print(f"[STATE] No existing state found ({e}) — starting fresh")
+        print(f"[STATE] No existing state ({e}) — starting fresh")
         return _fresh_state()
 
 
-def _fresh_state() -> dict:
-    return {
-        "schema_version": "1.0",
-        "status": "running",
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "last_updated": datetime.now(timezone.utc).isoformat(),
-        "class_counts": {str(k): 0 for k in INTENT_CLASSES.keys()},
-        "class_complete": {str(k): False for k in INTENT_CLASSES.keys()},
-        "daily_usage": {
-            "date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-            "groq": {m: 0 for m in ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "meta-llama/llama-4-scout-17b-16e-instruct"]},
-            "gemini_flash_lite": 0,
-            "gemini_flash": 0,
-            "gemini_pro": 0,
-            "mistral": 0,
-        },
-        "total_generated": 0,
-        "total_discarded": 0,
-        "run_count": 0,
-        "last_run_at": None,
-        "completed_at": None,
-    }
-
-
 def save_state(state: dict) -> bool:
-    """Push state JSON to HuggingFace dataset repo."""
-    state["last_updated"] = datetime.now(timezone.utc).isoformat()
+    """Push state to HuggingFace."""
+    state["last_updated"] = _now()
 
-    # Check if all classes done
-    all_done = all(state["class_complete"].values())
-    if all_done:
+    if all(state["class_complete"].values()):
         state["status"] = "complete"
-        state["completed_at"] = datetime.now(timezone.utc).isoformat()
+        if not state.get("completed_at"):
+            state["completed_at"] = _now()
 
     content = json.dumps(state, indent=2)
 
     try:
         from huggingface_hub import HfApi
         api = HfApi(token=HF_TOKEN)
-        
-        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.json', encoding='utf-8') as tmp:
+
+        with tempfile.NamedTemporaryFile(mode="w", delete=False,
+                                          suffix=".json", encoding="utf-8") as tmp:
             tmp.write(content)
             tmp_path = tmp.name
 
         api.upload_file(
             path_or_fileobj=tmp_path,
             path_in_repo=STATE_FILE,
-            repo_id=HF_DATASET_REPO,
+            repo_id=HF_REPO,
             repo_type="dataset",
-            token=HF_TOKEN,
-            commit_message=f"Update progress: {state['total_generated']} examples"
+            commit_message=f"Progress: {state['total_generated']:,} examples | "
+                           f"{sum(1 for v in state['class_complete'].values() if v)}/22 done",
         )
-        
         os.unlink(tmp_path)
-        print(f"[STATE] Saved — {state['total_generated']} total, {sum(1 for v in state['class_complete'].values() if v)} classes complete")
+
+        total = state["total_generated"]
+        done  = sum(1 for v in state["class_complete"].values() if v)
+        print(f"[STATE] Saved — {total:,} total | {done}/22 classes complete")
         return True
 
     except Exception as e:
-        print(f"[STATE] CRITICAL: Failed to save state — {e}")
+        print(f"[STATE] CRITICAL: Save failed — {e}")
         return False
 
 
-def reset_daily_usage_if_new_day(state: dict) -> dict:
-    """Reset daily API counters if it's a new UTC day."""
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+# ---------------------------------------------------------------------------
+# State helpers
+# ---------------------------------------------------------------------------
+
+def reset_daily_if_new_day(state: dict) -> dict:
+    today = _today()
     if state["daily_usage"]["date"] != today:
-        print(f"[STATE] New day {today} — resetting daily usage counters")
-        state["daily_usage"] = {
-            "date": today,
-            "groq": {m: 0 for m in ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "meta-llama/llama-4-scout-17b-16e-instruct"]},
-            "gemini_flash_lite": 0,
-            "gemini_flash": 0,
-            "gemini_pro": 0,
-            "mistral": 0,
-        }
+        print(f"[STATE] New day {today} — resetting daily counters")
+        state["daily_usage"] = _fresh_daily()
     return state
 
 
-def mark_class_complete(state: dict, class_id: int) -> dict:
-    """Mark a class as done — no more writes to it."""
-    state["class_complete"][str(class_id)] = True
-    label = INTENT_CLASSES[class_id]["label"]
-    count = state["class_counts"][str(class_id)]
-    print(f"[STATE] ✓ Class {class_id} ({label}) COMPLETE — {count} examples")
+def increment_count(state: dict, class_id: int, n: int) -> dict:
+    sid = str(class_id)
+    state["class_counts"][sid] = state["class_counts"].get(sid, 0) + n
+    state["total_generated"] += n
+    if state["class_counts"][sid] >= TARGET_PER_CLASS:
+        if not state["class_complete"].get(sid, False):
+            state["class_complete"][sid] = True
+            label = INTENT_CLASSES[class_id]["label"]
+            print(f"[STATE] ✓ Class {class_id} ({label}) COMPLETE — "
+                  f"{state['class_counts'][sid]:,} examples")
     return state
 
 
-def increment_class_count(state: dict, class_id: int, n: int) -> dict:
-    state["class_counts"][str(class_id)] = state["class_counts"].get(str(class_id), 0) + n
-    state["total_generated"] = state["total_generated"] + n
-    count = state["class_counts"][str(class_id)]
-    if count >= TARGET_PER_CLASS:
-        state = mark_class_complete(state, class_id)
+def increment_discard(state: dict, n: int = 1) -> dict:
+    state["total_discarded"] += n
     return state
 
 
-def get_remaining_for_class(state: dict, class_id: int) -> int:
-    current = state["class_counts"].get(str(class_id), 0)
-    return max(0, TARGET_PER_CLASS - current)
+def increment_api_usage(state: dict, provider: str, model: str) -> dict:
+    usage = state["daily_usage"]
+    if provider == "groq":
+        usage["groq"][model] = usage["groq"].get(model, 0) + 1
+    elif provider == "gemini":
+        usage["gemini"][model] = usage["gemini"].get(model, 0) + 1
+    elif provider == "mistral":
+        usage["mistral"] = usage.get("mistral", 0) + 1
+    return state
 
 
 def is_class_done(state: dict, class_id: int) -> bool:
@@ -147,20 +132,106 @@ def is_class_done(state: dict, class_id: int) -> bool:
 
 
 def is_all_done(state: dict) -> bool:
-    return state.get("status") == "complete" or all(state["class_complete"].values())
+    return state.get("status") == "complete" or all(
+        state["class_complete"].get(str(cid), False)
+        for cid in INTENT_CLASSES
+    )
+
+
+def remaining(state: dict, class_id: int) -> int:
+    current = state["class_counts"].get(str(class_id), 0)
+    return max(0, TARGET_PER_CLASS - current)
+
+
+def groq_model_exhausted(state: dict, model: str) -> bool:
+    used = state["daily_usage"]["groq"].get(model, 0)
+    limit = GROQ_RPD.get(model, 1000)
+    return used >= int(limit * 0.95)  # stop at 95% to leave headroom
+
+
+def gemini_model_exhausted(state: dict, model: str) -> bool:
+    used = state["daily_usage"]["gemini"].get(model, 0)
+    limit = GEMINI_RPD.get(model, 20)
+    return used >= int(limit * 0.95)
 
 
 def print_progress(state: dict):
-    print("\n" + "="*60)
-    print(f"UEG DATA GENERATION PROGRESS")
-    print(f"Total: {state['total_generated']} | Discarded: {state['total_discarded']}")
-    print(f"Run #{state['run_count']} | Last: {state['last_updated']}")
-    print("-"*60)
+    print("\n" + "=" * 62)
+    print(f"  UEG DATA GENERATION — RUN #{state['run_count']}")
+    print(f"  Total: {state['total_generated']:,} | Discarded: {state['total_discarded']:,}")
+    print(f"  Status: {state['status']} | Updated: {state['last_updated'][:19]}")
+    print("-" * 62)
     for cid, info in INTENT_CLASSES.items():
         count = state["class_counts"].get(str(cid), 0)
-        done = state["class_complete"].get(str(cid), False)
-        pct = min(100, int(count / TARGET_PER_CLASS * 100))
-        bar = ("█" * (pct // 5)).ljust(20)
-        status = "✓" if done else " "
-        print(f"  [{status}] {cid:2d} {info['label']:<28} {bar} {count:5d}/{TARGET_PER_CLASS}")
-    print("="*60 + "\n")
+        done  = state["class_complete"].get(str(cid), False)
+        pct   = min(100, int(count / TARGET_PER_CLASS * 100))
+        bar   = ("█" * (pct // 5)).ljust(20)
+        tick  = "✓" if done else " "
+        print(f"  [{tick}] {cid:2d} {info['label']:<28} {bar} {count:5,}/{TARGET_PER_CLASS:,}")
+    print("=" * 62 + "\n")
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+def _fresh_state() -> dict:
+    return {
+        "schema_version": "2.0",
+        "status":         "running",
+        "created_at":     _now(),
+        "last_updated":   _now(),
+        "completed_at":   None,
+        "run_count":      0,
+        "last_run_at":    None,
+        "total_generated": 0,
+        "total_discarded": 0,
+        "class_counts":   {str(k): 0 for k in INTENT_CLASSES},
+        "class_complete": {str(k): False for k in INTENT_CLASSES},
+        "daily_usage":    _fresh_daily(),
+    }
+
+
+def _fresh_daily() -> dict:
+    return {
+        "date":    _today(),
+        "groq":    {m: 0 for m in GROQ_MODELS},
+        "gemini":  {m: 0 for m in GEMINI_MODELS.values()},
+        "mistral": 0,
+    }
+
+
+def _migrate_state(state: dict) -> dict:
+    """Forward-migrate old state schemas."""
+    # Ensure all class keys exist
+    for cid in INTENT_CLASSES:
+        sid = str(cid)
+        state["class_counts"].setdefault(sid, 0)
+        state["class_complete"].setdefault(sid, False)
+        # Re-check completion in case target was lowered/raised
+        if state["class_counts"][sid] >= TARGET_PER_CLASS:
+            state["class_complete"][sid] = True
+
+    # Ensure daily_usage has current models
+    state.setdefault("total_discarded", 0)
+    state.setdefault("run_count", 0)
+    state.setdefault("status", "running")
+    du = state.setdefault("daily_usage", _fresh_daily())
+    du.setdefault("groq", {m: 0 for m in GROQ_MODELS})
+    du.setdefault("gemini", {m: 0 for m in GEMINI_MODELS.values()})
+    du.setdefault("mistral", 0)
+    # Add new Groq models if missing
+    for m in GROQ_MODELS:
+        du["groq"].setdefault(m, 0)
+    for m in GEMINI_MODELS.values():
+        du["gemini"].setdefault(m, 0)
+
+    return state
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _today() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")

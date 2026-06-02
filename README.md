@@ -1,81 +1,50 @@
-# UEG Training Data Generator
+# UEG Training Data Generator v2
 
-Automated pipeline that generates the 176,000+ labeled training examples needed for the Universal Edge Gateway (UEG) intent classifier.
+Automated pipeline generating 176,000+ labeled examples for the Universal Edge Gateway intent classifier.
 
 ## Architecture
 
-- **Groq** — volume engine for Tier 1–4 English classes (4 models in parallel, ~4K req/day each)
-- **Mistral** — Tier 5A + 5B English classes (1B token/month budget)
-- **Gemini Flash-Lite** — Tier 5B English overflow (1,000 req/day)
-- **Gemini Flash** — all non-English languages, lr_emerging, mul_mix (250 req/day)
-- **Gemini Pro** — hardest combos: lr_emerging + Tier 5B (100 req/day)
-- **Class 02 (adversarial_probe)** — pulled from existing public red-team HF datasets
+| Provider | Models | Role | Batch |
+|----------|--------|------|-------|
+| **Groq** | llama-3.1-8b, llama-3.3-70b, llama-4-scout | Standard English classes, volume | 20/call |
+| **Gemini (Gemma 4)** | gemma-4-26b, gemma-4-31b | Mixed-class, unlimited TPM | 80/call |
+| **Gemini (Flash)** | gemini-3.1-flash-lite, gemini-3.5-flash | Supplemental | 20/call |
+| **Mistral** | mistral-large, mistral-small | Tier 5A/5B overflow | 15/call |
+
+Groq + Gemini run in **parallel threads** simultaneously.
+
+## Language distribution
+70% English + 30% Arabic, Hindi, French, Spanish, Chinese, Swahili, Portuguese — enough for the classifier to learn intent is language-agnostic.
 
 ## Setup
 
-### 1. Fork / clone this repo (keep it PUBLIC — free unlimited Actions minutes)
+### 1. Create a public GitHub repo and push all files (keep public — free unlimited Actions minutes)
 
-### 2. Add GitHub Secrets
+### 2. Add secrets (Settings → Secrets → Actions)
+| Secret | Value |
+|--------|-------|
+| `GROQ_API_KEY` | your Groq key |
+| `GEMINI_API_KEY` | your Google AI Studio key |
+| `MISTRAL_API_KEY` | your Mistral key |
+| `HF_TOKEN` | your HuggingFace token |
 
-Go to **Settings → Secrets and variables → Actions → New repository secret**
+### 3. Enable Actions and trigger first run manually
 
-| Secret name     | Value |
-|----------------|-------|
-| `GROQ_API_KEY`  | your Groq key |
-| `GEMINI_API_KEY`| your Google AI Studio key |
-| `MISTRAL_API_KEY`| your Mistral key |
-| `HF_TOKEN`      | your HuggingFace access token |
-
-### 3. Enable GitHub Actions
-
-Go to **Actions tab → Enable workflows**
-
-### 4. Trigger first run manually
-
-Actions → **Generate UEG Training Data** → **Run workflow**
-
-The pipeline will then run automatically every 2 hours via cron.
+Runs automatically every 4 hours after that.
 
 ## How it works
-
-1. On every run, state is loaded from HuggingFace (`progress.json`)
-2. Generator fills each class toward 8,000 examples using the provider rotation
+1. Reads `progress.json` from HuggingFace on every startup — resumes exactly where it left off
+2. Groq + Gemini generate in parallel, Mistral fills remaining budget
 3. Every 50 examples → checkpoint pushed to HF + state saved
-4. On clean exit, full state saved — next run resumes exactly where this one stopped
-5. When a class hits 8,000 examples it's marked complete and never written to again
-6. When all 22 classes are complete, future runs exit immediately
+4. Completed classes never written to again
+5. All done → exits cleanly, future runs no-op
 
-## Stopping
-
-To pause generation: create a file named `STOP` in the repo root and push it.
-To resume: delete the `STOP` file.
+## Controls
+- **Pause:** create a file named `STOP` in repo root and push it
+- **Resume:** delete the `STOP` file
+- **Monitor:** Actions → Daily Status Report → Run workflow
 
 ## Output
+`https://huggingface.co/datasets/rufatronics/ueg-training-data`
 
-Dataset at: `https://huggingface.co/datasets/rufatronics/ueg-training-data`
-
-One JSONL file per class:
-```
-data/class_01_noise_gibberish.jsonl
-data/class_02_adversarial_probe.jsonl
-...
-data/class_22_multilingual_task.jsonl
-```
-
-Each line:
-```json
-{
-  "text": "...",
-  "intent_class_id": 13,
-  "intent_class_label": "code_task",
-  "tier": "5A",
-  "language_iso": "en",
-  "resource_class": "hr_global",
-  "generated_by": "groq:llama-3.3-70b-versatile",
-  "split": "train"
-}
-```
-
-## Monitoring
-
-Check daily status: Actions → **Generation Status Report** → **Run workflow**
+Per-class JSONL files + `progress.json` state.

@@ -1,0 +1,82 @@
+name: Generation Status Report
+
+on:
+  schedule:
+    - cron: "0 9 * * *"    # daily at 9am UTC
+  workflow_dispatch:
+
+jobs:
+  status:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Print progress report
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python - <<'EOF'
+          import os, requests, json
+
+          token = os.environ["HF_TOKEN"]
+          url = "https://huggingface.co/datasets/rufatronics/ueg-training-data/resolve/main/progress.json"
+          r = requests.get(url, headers={"Authorization": f"Bearer {token}"})
+
+          if r.status_code != 200:
+              print(f"Could not load state: HTTP {r.status_code}")
+              exit(0)
+
+          state = r.json()
+          total = state["total_generated"]
+          discarded = state["total_discarded"]
+          status = state["status"]
+          updated = state["last_updated"]
+          runs = state["run_count"]
+
+          TARGET = 8000
+          done_classes = sum(1 for v in state["class_complete"].values() if v)
+          total_target = 22 * TARGET
+
+          print(f"\n{'='*60}")
+          print(f"UEG TRAINING DATA — DAILY STATUS")
+          print(f"{'='*60}")
+          print(f"Status      : {status.upper()}")
+          print(f"Last updated: {updated}")
+          print(f"Total runs  : {runs}")
+          print(f"Generated   : {total:,} / {total_target:,} ({total/total_target*100:.1f}%)")
+          print(f"Discarded   : {discarded:,}")
+          print(f"Classes done: {done_classes}/22")
+          print(f"{'='*60}")
+
+          classes = {
+              1:"noise_gibberish", 2:"adversarial_probe", 3:"greeting_open",
+              4:"phatic_social", 5:"closure_gratitude", 6:"ui_command",
+              7:"ambient_device_query", 8:"navigation_intent", 9:"factoid_static",
+              10:"factoid_dynamic", 11:"transactional_status", 12:"casual_open_chat",
+              13:"code_task", 14:"data_structured", 15:"document_structured",
+              16:"math_formal", 17:"analysis_reasoning", 18:"long_form_creative",
+              19:"domain_specialist", 20:"instruction_procedural", 21:"debate_opinion",
+              22:"multilingual_task"
+          }
+
+          for cid, label in classes.items():
+              count = state["class_counts"].get(str(cid), 0)
+              complete = state["class_complete"].get(str(cid), False)
+              pct = min(100, count / TARGET * 100)
+              bar = ("█" * int(pct // 5)).ljust(20)
+              tick = "✓" if complete else " "
+              print(f"  [{tick}] {cid:2d} {label:<28} {bar} {count:5,}/{TARGET:,}")
+
+          print(f"{'='*60}\n")
+          EOF

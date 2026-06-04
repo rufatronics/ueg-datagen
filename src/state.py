@@ -123,7 +123,9 @@ def increment_api_usage(state: dict, provider: str, model: str) -> dict:
     elif provider == "gemini":
         usage["gemini"][model] = usage["gemini"].get(model, 0) + 1
     elif provider == "mistral":
-        usage["mistral"] = usage.get("mistral", 0) + 1
+        if not isinstance(usage.get("mistral"), dict):
+            usage["mistral"] = {}
+        usage["mistral"][model] = usage["mistral"].get(model, 0) + 1
     return state
 
 
@@ -193,11 +195,12 @@ def _fresh_state() -> dict:
 
 
 def _fresh_daily() -> dict:
+    from taxonomy import GROQ_MODELS, GEMINI_MODELS, MISTRAL_MODELS
     return {
         "date":    _today(),
         "groq":    {m: 0 for m in GROQ_MODELS},
         "gemini":  {m: 0 for m in GEMINI_MODELS.values()},
-        "mistral": 0,
+        "mistral": {m: 0 for m in MISTRAL_MODELS.values()},
     }
 
 
@@ -219,7 +222,12 @@ def _migrate_state(state: dict) -> dict:
     du = state.setdefault("daily_usage", _fresh_daily())
     du.setdefault("groq", {m: 0 for m in GROQ_MODELS})
     du.setdefault("gemini", {m: 0 for m in GEMINI_MODELS.values()})
-    du.setdefault("mistral", 0)
+    # Migrate mistral from old int to new dict
+    if not isinstance(du.get("mistral"), dict):
+        du["mistral"] = {}
+    from taxonomy import MISTRAL_MODELS
+    for m in MISTRAL_MODELS.values():
+        du["mistral"].setdefault(m, 0)
     # Add new Groq models if missing
     for m in GROQ_MODELS:
         du["groq"].setdefault(m, 0)

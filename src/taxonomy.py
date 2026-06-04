@@ -98,10 +98,40 @@ GEMINI_RPM = {
     "gemini-3.5-flash":       5,
 }
 
-# Mistral
+# Mistral — confirmed from La Plateforme limits dashboard
+# RPS = requests per second, TPM = tokens per minute, no monthly cap
 MISTRAL_MODELS = {
-    "large": "mistral-large-latest",
-    "small": "mistral-small-latest",
+    # High volume — simple/medium classes
+    "ministral_3b":  "ministral-3b-2512",      # 12.50 RPS, 1,300,000 TPM — absolute volume horse
+    "ministral_8b":  "ministral-8b-2512",      # 3.13  RPS,   625,000 TPM
+    "small":         "mistral-small-2506",      # 5.00  RPS, 2,250,000 TPM — best TPM on list
+    # Code-specialized
+    "codestral":     "codestral-2508",          # 2.08  RPS,   625,000 TPM — code_task + data_structured
+    "devstral":      "devstral-2512",           # 0.83  RPS, 1,000,000 TPM — pairs with codestral
+    # Quality — complex classes
+    "ministral_14b": "ministral-14b-2512",      # 0.50  RPS,   937,500 TPM
+    "nemo":          "open-mistral-nemo",       # 0.50  RPS,   937,500 TPM
+    "medium":        "mistral-medium-2505",     # 0.42  RPS,   375,000 TPM
+}
+
+# RPS per model — sleep = 1/RPS between requests
+MISTRAL_RPS = {
+    "ministral-3b-2512":   12.50,
+    "ministral-8b-2512":    3.13,
+    "mistral-small-2506":   5.00,
+    "codestral-2508":       2.08,
+    "devstral-2512":        0.83,
+    "ministral-14b-2512":   0.50,
+    "open-mistral-nemo":    0.50,
+    "mistral-medium-2505":  0.42,
+}
+
+# Which Mistral model handles which class tiers
+# code/data classes get codestral+devstral, volume gets ministral-3b, quality gets medium
+MISTRAL_ROUTING = {
+    "volume":   ["ministral-3b-2512", "ministral-8b-2512", "mistral-small-2506"],  # Tier 1-4
+    "code":     ["codestral-2508", "devstral-2512"],                                # class 13,14
+    "quality":  ["ministral-14b-2512", "open-mistral-nemo", "mistral-medium-2505"], # Tier 5A/5B
 }
 
 # ---------------------------------------------------------------------------
@@ -112,7 +142,9 @@ BATCH_SIZES = {
     "groq":          20,   # single class per call
     "gemma4":        80,   # mixed classes per call — unlimited TPM
     "gemini_flash":  20,   # single class per call
-    "mistral":       15,   # single class per call
+    "mistral_volume": 25,  # ministral-3b is fast, go bigger
+    "mistral_code":   20,  # codestral/devstral
+    "mistral_quality": 15, # quality models
 }
 
 # ---------------------------------------------------------------------------

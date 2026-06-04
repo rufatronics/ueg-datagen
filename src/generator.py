@@ -19,7 +19,7 @@ from taxonomy import (
 )
 from clients import (
     call_groq, call_gemini, call_mistral, fetch_adversarial_from_hf,
-    GROQ_INTER_REQUEST_SLEEP, GEMINI_INTER_REQUEST_SLEEP, MISTRAL_INTER_REQUEST_SLEEP,
+    GROQ_INTER_REQUEST_SLEEP, GEMINI_INTER_REQUEST_SLEEP,
 )
 from prompts import build_single_class_prompt, build_mixed_class_prompt, SYSTEM_PROMPT
 from verify import verify_batch
@@ -237,39 +237,37 @@ def _run_gemini(buf: CheckpointBuffer, deadline: float):
 
 
 # ---------------------------------------------------------------------------
-# Mistral (sequential)
+# Mistral — multiple models in parallel, each respecting its own RPS
 # ---------------------------------------------------------------------------
 
-def _run_mistral(buf: CheckpointBuffer, deadline: float):
-    """Generate with Mistral sequentially."""
-    all_class_ids = [cid for cid in INTENT_CLASSES if cid != 2]
+def _run_mistral_model(buf: CheckpointBuffer, deadline: float,
+                        model: str, eligible_classes: list[int], batch_size: int):
+    """Run a single Mistral model continuously until deadline or quota."""
+    from clients import call_mistral, mistral_sleep
+    sleep_time = mistral_sleep(model)
 
     while time.time() < deadline:
         if is_all_done(buf.state):
             break
 
-        eligible = [cid for cid in all_class_ids if not is_class_done(buf.state, cid)]
-        if not eligible:
+        # Filter to still-incomplete classes from our eligible set
+        active = [cid for cid in eligible_classes if not is_class_done(buf.state, cid)]
+        if not active:
             break
 
-        class_id = random.choice(eligible)
+        class_id = random.choice(active)
         rem      = remaining(buf.state, class_id)
         if rem == 0:
             continue
 
-        # Use large for Tier 5, small for everything else
-        tier  = INTENT_CLASSES[class_id]["tier"]
-        model = MISTRAL_MODELS["large"] if str(tier) in ("5A", "5B") else MISTRAL_MODELS["small"]
-
-        batch_size = min(BATCH_SIZES["mistral"], rem)
-        sys_p, usr_p, lang = build_single_class_prompt(class_id, batch_size)
-
+        size     = min(batch_size, rem)
+        sys_p, usr_p, lang = build_single_class_prompt(class_id, size)
         response = call_mistral(sys_p, usr_p, model)
 
         with buf.lock:
             buf.state = increment_api_usage(buf.state, "mistral", model)
 
-        time.sleep(MISTRAL_INTER_REQUEST_SLEEP)
+        time.sleep(sleep_time)
 
         if response is None:
             buf.add_discard()
@@ -280,9 +278,54 @@ def _run_mistral(buf: CheckpointBuffer, deadline: float):
 
         if valid:
             buf.add(class_id, valid, "mistral", model)
-            print(f"[Mistral/{model}] class {class_id} lang={lang} — "
+            short = model.split("-")[0] + "-" + model.split("-")[1] if "-" in model else model
+            print(f"[Mistral/{short}] class {class_id} lang={lang} — "
                   f"{len(valid)} valid, {discards} discarded")
             buf.flush_if_ready()
+
+
+def _run_mistral(buf: CheckpointBuffer, deadline: float):
+    """
+    Launch all Mistral models in parallel threads, each on its own RPS schedule.
+    - Volume models (ministral-3b, ministral-8b, mistral-small): Tier 1-4 classes
+    - Code models (codestral, devstral): classes 13 and 14 only
+    - Quality models (ministral-14b, nemo, medium): Tier 5A/5B classes
+    """
+    from taxonomy import MISTRAL_ROUTING, BATCH_SIZES
+
+    all_non_adv = [cid for cid in INTENT_CLASSES if cid != 2]
+    tier5_classes    = [cid for cid, v in INTENT_CLASSES.items()
+                        if str(v["tier"]) in ("5A", "5B")]
+    code_classes     = [13, 14]
+    volume_classes   = [cid for cid in all_non_adv
+                        if cid not in tier5_classes and cid not in code_classes]
+
+    thread_specs = [
+        # (model,                    eligible_classes,  batch_size)
+        ("ministral-3b-2512",        volume_classes,    BATCH_SIZES["mistral_volume"]),
+        ("ministral-8b-2512",        volume_classes,    BATCH_SIZES["mistral_volume"]),
+        ("mistral-small-2506",       volume_classes,    BATCH_SIZES["mistral_volume"]),
+        ("codestral-2508",           code_classes,      BATCH_SIZES["mistral_code"]),
+        ("devstral-2512",            code_classes,      BATCH_SIZES["mistral_code"]),
+        ("ministral-14b-2512",       tier5_classes,     BATCH_SIZES["mistral_quality"]),
+        ("open-mistral-nemo",        tier5_classes,     BATCH_SIZES["mistral_quality"]),
+        ("mistral-medium-2505",      tier5_classes,     BATCH_SIZES["mistral_quality"]),
+    ]
+
+    threads = []
+    for model, eligible, batch_size in thread_specs:
+        t = threading.Thread(
+            target=_run_mistral_model,
+            args=(buf, deadline, model, eligible, batch_size),
+            daemon=True,
+        )
+        threads.append(t)
+
+    print(f"\n[Mistral] Launching {len(threads)} model threads in parallel")
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
 
 
 # ---------------------------------------------------------------------------
@@ -332,21 +375,20 @@ def run_generation_cycle(state: dict, time_budget_seconds: int = 5400) -> dict:
     # Phase 1 — adversarial class (quick, from HF)
     _run_adversarial(buf)
 
-    # Phase 2 — Groq + Gemini in parallel
-    groq_thread   = threading.Thread(target=_run_groq,   args=(buf, deadline), daemon=True)
-    gemini_thread = threading.Thread(target=_run_gemini, args=(buf, deadline), daemon=True)
+    # Phase 2 — Groq + Gemini + Mistral all in parallel simultaneously
+    # Each provider runs in its own thread, all three at the same time
+    groq_thread   = threading.Thread(target=_run_groq,    args=(buf, deadline), daemon=True)
+    gemini_thread = threading.Thread(target=_run_gemini,  args=(buf, deadline), daemon=True)
+    mistral_thread = threading.Thread(target=_run_mistral, args=(buf, deadline), daemon=True)
 
+    print("[ENGINE] Launching Groq + Gemini + Mistral in parallel\n")
     groq_thread.start()
     gemini_thread.start()
+    mistral_thread.start()
 
     groq_thread.join()
     gemini_thread.join()
-
-    # Phase 3 — Mistral (remaining budget)
-    remaining_budget = int(deadline - time.time())
-    if remaining_budget > 60:
-        print(f"\n[ENGINE] Starting Mistral phase ({remaining_budget}s remaining)")
-        _run_mistral(buf, deadline)
+    mistral_thread.join()
 
     # Final checkpoint
     buf.flush_if_ready(force=True)

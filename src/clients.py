@@ -20,9 +20,15 @@ MISTRAL_API_KEY = os.environ["MISTRAL_API_KEY"]
 # Rate limit sleeps — strictly enforced
 # ---------------------------------------------------------------------------
 
-GROQ_INTER_REQUEST_SLEEP   = 2.1   # 30 RPM = 1 req/2s, add 0.1s buffer
-GEMINI_INTER_REQUEST_SLEEP = 4.1   # 15 RPM = 1 req/4s, add 0.1s buffer
-MISTRAL_INTER_REQUEST_SLEEP = 3.0  # conservative
+GROQ_INTER_REQUEST_SLEEP   = 2.1   # 30 RPM = 1 req/2s + buffer
+GEMINI_INTER_REQUEST_SLEEP = 4.1   # 15 RPM = 1 req/4s + buffer
+
+
+def mistral_sleep(model: str) -> float:
+    """Return correct sleep duration for a Mistral model based on its RPS limit."""
+    from taxonomy import MISTRAL_RPS
+    rps = MISTRAL_RPS.get(model, 0.5)
+    return (1.0 / rps) + 0.05  # add small buffer
 
 
 # ---------------------------------------------------------------------------

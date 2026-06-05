@@ -1,9 +1,8 @@
 """
 Main generation engine.
-- Groq thread + Gemini thread run simultaneously
-- Mistral runs sequentially after
+- Groq + Gemini + Mistral all run in parallel threads simultaneously
 - Strict per-provider sleeps enforced
-- Checkpoints every 50 new examples
+- Checkpoints every 500 new examples — ONE commit per checkpoint via upload_folder
 - Respects class completion — never writes to finished classes
 """
 
@@ -23,14 +22,14 @@ from clients import (
 )
 from prompts import build_single_class_prompt, build_mixed_class_prompt, SYSTEM_PROMPT
 from verify import verify_batch
-from hf_push import push_examples, push_readme
+from hf_push import push_batch, push_readme
 from state import (
     increment_count, increment_discard, increment_api_usage,
     is_class_done, is_all_done, remaining, save_state,
     groq_model_exhausted, gemini_model_exhausted,
 )
 
-CHECKPOINT_EVERY = 50   # push to HF every N new examples
+CHECKPOINT_EVERY = 500  # 500 examples = 1 commit — well under 128/hour limit
 
 
 # ---------------------------------------------------------------------------
@@ -69,20 +68,18 @@ class CheckpointBuffer:
         if not has_data:
             return False
 
-        print(f"\n[CHECKPOINT] Pushing {self.count} new examples...")
-        for class_id, examples in self.pending.items():
-            if examples:
-                push_examples(class_id, examples)
+        total = sum(len(v) for v in self.pending.values())
+        print(f"\n[CHECKPOINT] Pushing {total:,} examples in 1 commit...")
 
-        save_state(self.state)
-        try:
-            push_readme(self.state)
-        except Exception as e:
-            print(f"[CHECKPOINT] README failed (non-critical): {e}")
+        # One upload_folder call = one commit — no more rate limit issues
+        success = push_batch(self.pending, self.state)
 
-        self.pending = {cid: [] for cid in INTENT_CLASSES}
-        self.count   = 0
-        return True
+        if success:
+            save_state(self.state)
+            self.pending = {cid: [] for cid in INTENT_CLASSES}
+            self.count   = 0
+
+        return success
 
 
 # ---------------------------------------------------------------------------

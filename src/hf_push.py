@@ -1,12 +1,14 @@
 """
 HuggingFace dataset pusher.
 One JSONL file per class. Appends only — never overwrites.
-Uses huggingface_hub library (new commit API).
+Uses upload_folder — ALL changed files in ONE commit.
+Eliminates the 128 commits/hour rate limit problem entirely.
 """
 
 import os
 import json
 import time
+import shutil
 import tempfile
 from taxonomy import INTENT_CLASSES, TARGET_PER_CLASS
 
@@ -19,65 +21,105 @@ def _api():
     return HfApi(token=HF_TOKEN)
 
 
-def _class_path(class_id: int) -> str:
+def _class_filename(class_id: int) -> str:
     label = INTENT_CLASSES[class_id]["label"]
-    return f"data/class_{class_id:02d}_{label}.jsonl"
+    return f"class_{class_id:02d}_{label}.jsonl"
 
 
-def push_examples(class_id: int, examples: list[dict]) -> bool:
-    """Append examples to the class JSONL file. Creates if absent."""
-    if not examples:
+def push_batch(pending: dict[int, list[dict]], state: dict) -> bool:
+    """
+    Push ALL pending examples across ALL classes in ONE commit using upload_folder.
+    pending = {class_id: [list of new examples]}
+    This is the core fix — 1 commit regardless of how many classes changed.
+    """
+    if not any(len(v) > 0 for v in pending.values()):
         return True
 
-    path = _class_path(class_id)
-    api  = _api()
+    api      = _api()
+    tmp_dir  = tempfile.mkdtemp()
+    data_dir = os.path.join(tmp_dir, "data")
+    os.makedirs(data_dir, exist_ok=True)
 
-    # Fetch existing content
+    total_new = 0
+
     try:
-        local = api.hf_hub_download(
-            repo_id=HF_REPO, filename=path,
-            repo_type="dataset", token=HF_TOKEN,
-            force_download=True,
-        )
-        with open(local, "r", encoding="utf-8") as f:
-            existing = f.read()
-    except Exception:
-        existing = ""
+        for class_id, new_examples in pending.items():
+            if not new_examples:
+                continue
 
-    # Build new content
-    new_lines = "\n".join(json.dumps(ex, ensure_ascii=False) for ex in examples) + "\n"
-    full      = existing + new_lines
+            filename   = _class_filename(class_id)
+            local_path = os.path.join(data_dir, filename)
 
-    # Write and upload
-    for attempt in range(3):
-        try:
-            with tempfile.NamedTemporaryFile(mode="w", delete=False,
-                                             suffix=".jsonl", encoding="utf-8") as tmp:
-                tmp.write(full)
-                tmp_path = tmp.name
-
-            api.upload_file(
-                path_or_fileobj=tmp_path,
-                path_in_repo=path,
-                repo_id=HF_REPO,
-                repo_type="dataset",
-                commit_message=f"Add {len(examples)} examples → class {class_id}",
-            )
-            os.unlink(tmp_path)
-            print(f"[HF] ✓ {len(examples)} examples → {path}")
-            return True
-
-        except Exception as e:
-            print(f"[HF] Push attempt {attempt + 1} failed for class {class_id}: {e}")
+            # Fetch existing content from HF
+            existing = ""
             try:
-                os.unlink(tmp_path)
+                from huggingface_hub import hf_hub_download
+                dl = hf_hub_download(
+                    repo_id=HF_REPO,
+                    filename=f"data/{filename}",
+                    repo_type="dataset",
+                    token=HF_TOKEN,
+                    force_download=True,
+                )
+                with open(dl, "r", encoding="utf-8") as f:
+                    existing = f.read()
             except Exception:
-                pass
-            if attempt < 2:
-                time.sleep(10 * (attempt + 1))
+                existing = ""  # file doesn't exist yet — fine
 
-    print(f"[HF] FAILED to push class {class_id} after 3 attempts")
-    return False
+            # Append new examples
+            new_lines = "\n".join(
+                json.dumps(ex, ensure_ascii=False) for ex in new_examples
+            ) + "\n"
+
+            with open(local_path, "w", encoding="utf-8") as f:
+                f.write(existing + new_lines)
+
+            total_new += len(new_examples)
+            print(f"[HF] Staged {len(new_examples):,} examples → data/{filename}")
+
+        # Also write updated progress.json into the folder
+        progress_path = os.path.join(tmp_dir, "progress.json")
+        with open(progress_path, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2)
+
+        # Write updated README
+        readme_path = os.path.join(tmp_dir, "README.md")
+        with open(readme_path, "w", encoding="utf-8") as f:
+            f.write(_build_readme(state))
+
+        # ONE upload_folder call = ONE commit — solves the rate limit
+        for attempt in range(3):
+            try:
+                api.upload_folder(
+                    folder_path=tmp_dir,
+                    repo_id=HF_REPO,
+                    repo_type="dataset",
+                    commit_message=(
+                        f"Checkpoint: +{total_new:,} examples | "
+                        f"{state['total_generated']:,} total | "
+                        f"{sum(1 for v in state['class_complete'].values() if v)}/22 done"
+                    ),
+                    ignore_patterns=["*.pyc", "__pycache__"],
+                )
+                print(f"[HF] ✓ Pushed {total_new:,} new examples in 1 commit")
+                return True
+
+            except Exception as e:
+                err = str(e)
+                if "rate limit" in err.lower() or "128" in err:
+                    # HF commit rate limit — wait it out
+                    print(f"[HF] Commit rate limit hit — waiting 15 minutes")
+                    time.sleep(900)
+                else:
+                    print(f"[HF] Upload attempt {attempt + 1} failed: {e}")
+                    if attempt < 2:
+                        time.sleep(15 * (attempt + 1))
+
+        print("[HF] FAILED to push after 3 attempts")
+        return False
+
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def ensure_repo_exists():
@@ -99,8 +141,7 @@ def ensure_repo_exists():
         print(f"[HF] Repo check error: {e}")
 
 
-def push_readme(state: dict):
-    """Update README with current progress."""
+def _build_readme(state: dict) -> str:
     lines = [
         "# UEG Training Data\n\n",
         "Auto-generated training dataset for the Universal Edge Gateway (UEG) "
@@ -115,25 +156,13 @@ def push_readme(state: dict):
     for cid, info in INTENT_CLASSES.items():
         count = state["class_counts"].get(str(cid), 0)
         done  = "✅" if state["class_complete"].get(str(cid), False) else "🔄"
-        lines.append(f"| {cid} | {info['label']} | {count:,} | {TARGET_PER_CLASS:,} | {done} |\n")
-
-    content = "".join(lines)
-
-    try:
-        api = _api()
-        with tempfile.NamedTemporaryFile(mode="w", delete=False,
-                                          suffix=".md", encoding="utf-8") as tmp:
-            tmp.write(content)
-            tmp_path = tmp.name
-
-        api.upload_file(
-            path_or_fileobj=tmp_path,
-            path_in_repo="README.md",
-            repo_id=HF_REPO,
-            repo_type="dataset",
-            commit_message="Update README",
+        lines.append(
+            f"| {cid} | {info['label']} | {count:,} | {TARGET_PER_CLASS:,} | {done} |\n"
         )
-        os.unlink(tmp_path)
-        print("[HF] README updated")
-    except Exception as e:
-        print(f"[HF] README update failed (non-critical): {e}")
+    return "".join(lines)
+
+
+# Keep push_readme as a standalone for state.py compatibility
+def push_readme(state: dict):
+    """Standalone README push — used by state save."""
+    pass  # README is now bundled into push_batch — no separate commit needed

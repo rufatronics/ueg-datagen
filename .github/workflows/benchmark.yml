@@ -253,20 +253,17 @@ jobs:
               ts = time.strftime('%Y%m%d_%H%M%S')
               with open(os.path.join(tmp, f"benchmark_{ts}.json"), "w") as f:
                   json.dump(summary, f, indent=2, ensure_ascii=False)
-              readme = f"""# UEG Benchmark Results
-
-Auto-generated: UEG vs Regex vs Llama-3.1-8B
-
-## Latest ({summary['run_at'][:10]})
-
-| Classifier | Accuracy | Avg Latency |
-|------------|----------|-------------|
-| **UEG** | **{ueg_acc:.1f}%** | **{avg(ueg_lats):.1f}ms** |
-| Regex | {regex_acc:.1f}% ({regex_total}/{len(TEST_CASES)} matched) | {avg(regex_lats):.3f}ms |
-| Llama-3.1-8B | {llama_acc:.1f}% | {avg(llama_lats):.0f}ms |
-
-Test cases: {len(TEST_CASES)} | Endpoint: {UEG_ENDPOINT}
-"""
+              readme = (
+                  "# UEG Benchmark Results\n\n"
+                  "Auto-generated: UEG vs Regex vs Llama-3.1-8B\n\n"
+                  f"## Latest ({summary['run_at'][:10]})\n\n"
+                  "| Classifier | Accuracy | Avg Latency |\n"
+                  "|------------|----------|-------------|\n"
+                  f"| UEG | {ueg_acc:.1f}% | {avg(ueg_lats):.1f}ms |\n"
+                  f"| Regex | {regex_acc:.1f}% ({regex_total}/{len(TEST_CASES)} matched) | {avg(regex_lats):.3f}ms |\n"
+                  f"| Llama-3.1-8B | {llama_acc:.1f}% | {avg(llama_lats):.0f}ms |\n\n"
+                  f"Test cases: {len(TEST_CASES)} | Endpoint: {UEG_ENDPOINT}\n"
+              )
               with open(os.path.join(tmp, "README.md"), "w") as f:
                   f.write(readme)
               api.upload_folder(

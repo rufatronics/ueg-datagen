@@ -1,9 +1,25 @@
+import sys
+print(f"Python {sys.version}")
+print("Starting benchmark...")
+sys.stdout.flush()
+
 import os, json, time, re, requests, tempfile, shutil, statistics
+print("Imports done")
+sys.stdout.flush()
+
 from huggingface_hub import HfApi
+print("HfApi imported")
+sys.stdout.flush()
+
 from groq import Groq
+print("Groq imported")
+sys.stdout.flush()
 
 HF_TOKEN     = os.environ["HF_TOKEN"]
 GROQ_API_KEY = os.environ["GROQ_API_KEY"]
+print(f"Tokens loaded — HF={'set' if HF_TOKEN else 'MISSING'} GROQ={'set' if GROQ_API_KEY else 'MISSING'}")
+sys.stdout.flush()
+
 UEG_ENDPOINT = "https://ueg-api.onrender.com"
 HF_REPO      = "rufatronics/ueg-benchmark-results"
 MODEL        = "llama-3.1-8b-instant"
@@ -335,8 +351,4 @@ try:
         lp = pct(s["llama"][0], s["llama"][1])
         lines.append(f"| {cat} | {up}% | {rp} | {lp}% |\n")
     lines += [
-        f"\nTest cases: {len(TEST_CASES)} | Endpoint: {UEG_ENDPOINT}\n\n",
-        "## Why UEG\n\n",
-        "- **Coverage**: Regex fails on non-English, noisy text, and Tier 5 inputs entirely\n",
-        "- **Accuracy**: Regex gets ambiguous cases wrong — same words, different intent\n",
-        f"- **Speed**: UEG is {round(avg(llama_lats)/max(avg(ueg_lats),0.1))}x faster than Llama for classification
+        f"\nTest cases: {len(TEST_CASES)} | Endpoint: {U

@@ -1,0 +1,9 @@
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+onnxruntime>=1.18.0
+numpy>=1.26.0
+tokenizers>=0.19.0
+lingua-language-detector>=2.0.2
+huggingface_hub>=0.23.0
+pydantic>=2.0.0
+python-dotenv>=1.0.0

@@ -1,0 +1,67 @@
+name: Daily Status Report
+
+on:
+  schedule:
+    - cron: "0 9 * * *"   # 9am UTC daily
+  workflow_dispatch:
+
+jobs:
+  status:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Status report
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python3 - <<'EOF'
+          import os, requests, json
+
+          token = os.environ["HF_TOKEN"]
+          url   = "https://huggingface.co/datasets/rufatronics/ueg-training-data/resolve/main/progress.json"
+          r     = requests.get(url, headers={"Authorization": f"Bearer {token}"})
+
+          if r.status_code != 200:
+              print(f"Could not load state: HTTP {r.status_code}")
+              exit(0)
+
+          s = r.json()
+          TARGET = 8000
+          classes = {
+              1:"noise_gibberish", 2:"adversarial_probe", 3:"greeting_open",
+              4:"phatic_social", 5:"closure_gratitude", 6:"ui_command",
+              7:"ambient_device_query", 8:"navigation_intent", 9:"factoid_static",
+              10:"factoid_dynamic", 11:"transactional_status", 12:"casual_open_chat",
+              13:"code_task", 14:"data_structured", 15:"document_structured",
+              16:"math_formal", 17:"analysis_reasoning", 18:"long_form_creative",
+              19:"domain_specialist", 20:"instruction_procedural", 21:"debate_opinion",
+              22:"multilingual_task"
+          }
+          done_count = sum(1 for v in s["class_complete"].values() if v)
+          total      = s["total_generated"]
+          target     = 22 * TARGET
+          pct        = total / target * 100
+
+          print(f"\n{'='*62}")
+          print(f"  UEG DATASET — DAILY STATUS")
+          print(f"  {s['last_updated'][:19]} UTC")
+          print(f"{'='*62}")
+          print(f"  Status    : {s['status'].upper()}")
+          print(f"  Progress  : {total:,} / {target:,} ({pct:.1f}%)")
+          print(f"  Discarded : {s.get('total_discarded', 0):,}")
+          print(f"  Runs done : {s.get('run_count', 0)}")
+          print(f"  Classes   : {done_count}/22 complete")
+          print(f"{'='*62}")
+          for cid, label in classes.items():
+              count = s["class_counts"].get(str(cid), 0)
+              done  = s["class_complete"].get(str(cid), False)
+              pct   = min(100, count / TARGET * 100)
+              bar   = ("█" * int(pct // 5)).ljust(20)
+              tick  = "✓" if done else " "
+              print(f"  [{tick}] {cid:2d} {label:<28} {bar} {count:5,}/{TARGET:,}")
+          print(f"{'='*62}\n")
+          EOF

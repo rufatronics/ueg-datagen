@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: ueg-api
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    envVars:
+      - key: MODEL_REPO
+        value: rufatronics/ueg-classifier
+      - key: PORT
+        value: 8000
+      - key: ORT_THREADS
+        value: 2
+      - key: MODEL_CACHE_DIR
+        value: /tmp/ueg-cache
+    healthCheckPath: /health

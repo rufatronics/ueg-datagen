@@ -1,0 +1,57 @@
+name: Generate UEG Training Data
+
+on:
+  schedule:
+    - cron: "0 */4 * * *"   # every 4 hours — respects daily API limits
+  workflow_dispatch:          # manual trigger anytime
+  repository_dispatch:
+    types: [resume-generation]
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 105      # hard kill at 105min — script exits at 90min
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Check STOP flag
+        id: stopcheck
+        run: |
+          if [ -f STOP ]; then
+            echo "STOP file present — skipping this run"
+            echo "stopped=true" >> $GITHUB_OUTPUT
+          else
+            echo "stopped=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run generator
+        if: steps.stopcheck.outputs.stopped == 'false'
+        env:
+          GROQ_API_KEY:    ${{ secrets.GROQ_API_KEY }}
+          GEMINI_API_KEY:  ${{ secrets.GEMINI_API_KEY }}
+          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
+          HF_TOKEN:        ${{ secrets.HF_TOKEN }}
+        run: |
+          cd src
+          python main.py
+
+      - name: Summary
+        if: always()
+        run: echo "Finished at $(date -u)"

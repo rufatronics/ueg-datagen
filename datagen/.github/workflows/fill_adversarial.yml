@@ -1,0 +1,198 @@
+name: Fill Adversarial Class
+
+on:
+  workflow_dispatch:  # manual trigger only
+
+jobs:
+  fill-adversarial:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests huggingface_hub
+
+      - name: Fill adversarial class
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python3 - <<'EOF'
+          import os, json, requests, shutil, tempfile
+          from huggingface_hub import HfApi, hf_hub_download
+
+          TOKEN   = os.environ["HF_TOKEN"]
+          REPO    = "rufatronics/ueg-training-data"
+          TARGET  = 8000
+          api     = HfApi(token=TOKEN)
+
+          # -------------------------------------------------------------------
+          # Verified real datasets — confirmed existing on HuggingFace
+          # -------------------------------------------------------------------
+          SOURCES = [
+            {
+              "name": "neuralchemy/Prompt-injection-dataset",
+              "url":  "https://datasets-server.huggingface.co/rows?dataset=neuralchemy%2FPrompt-injection-dataset&config=full&split=train&offset=0&length=100",
+              "text_field": "text",
+              "max": 4000,
+            },
+            {
+              "name": "Harelix/Prompt-Injection-Mixed-Techniques-2024",
+              "url":  "https://datasets-server.huggingface.co/rows?dataset=Harelix%2FPrompt-Injection-Mixed-Techniques-2024&config=default&split=train&offset=0&length=100",
+              "text_field": "text",
+              "max": 1174,
+            },
+            {
+              "name": "yanismiraoui/prompt_injections",
+              "url":  "https://datasets-server.huggingface.co/rows?dataset=yanismiraoui%2Fprompt_injections&config=default&split=train&offset=0&length=100",
+              "text_field": "text",
+              "max": 1000,
+            },
+            {
+              "name": "reshabhs/SPML_Chatbot_Prompt_Injection",
+              "url":  "https://datasets-server.huggingface.co/rows?dataset=reshabhs%2FSPML_Chatbot_Prompt_Injection&config=default&split=train&offset=0&length=100",
+              "text_field": "prompt",
+              "max": 500,
+            },
+            {
+              "name": "rubend18/ChatGPT-Jailbreak-Prompts",
+              "url":  "https://datasets-server.huggingface.co/rows?dataset=rubend18%2FChatGPT-Jailbreak-Prompts&config=default&split=train&offset=0&length=100",
+              "text_field": "Prompt",
+              "max": 500,
+            },
+          ]
+
+          headers = {"Authorization": f"Bearer {TOKEN}"}
+
+          # -------------------------------------------------------------------
+          # Fetch from all sources with pagination
+          # -------------------------------------------------------------------
+          all_examples = []
+          seen_texts   = set()
+
+          for source in SOURCES:
+            if len(all_examples) >= TARGET:
+              break
+
+            fetched = 0
+            offset  = 0
+            limit   = 100
+            name    = source["name"]
+            field   = source["text_field"]
+            src_max = source["max"]
+
+            print(f"\n[FETCH] {name}")
+
+            while fetched < src_max and len(all_examples) < TARGET:
+              url = (
+                source["url"].split("&offset=")[0]
+                + f"&offset={offset}&length={limit}"
+              )
+              try:
+                r = requests.get(url, headers=headers, timeout=30)
+                if r.status_code != 200:
+                  print(f"  HTTP {r.status_code} — stopping this source")
+                  break
+
+                rows = r.json().get("rows", [])
+                if not rows:
+                  break
+
+                for row in rows:
+                  text = row.get("row", {}).get(field, "")
+                  if not text or not isinstance(text, str):
+                    continue
+                  text = text.strip()
+                  if len(text) < 10:
+                    continue
+                  if text in seen_texts:
+                    continue
+                  seen_texts.add(text)
+                  all_examples.append({
+                    "text":               text,
+                    "intent_class_id":    2,
+                    "intent_class_label": "adversarial_probe",
+                    "tier":               "1",
+                    "language_iso":       "en",
+                    "resource_class":     "hr_global",
+                    "generated_by":       f"hf:{name}",
+                    "split":              "train",
+                  })
+                  fetched += 1
+
+                offset += limit
+                print(f"  Fetched {fetched} so far...")
+
+              except Exception as e:
+                print(f"  Error: {e}")
+                break
+
+            print(f"  Total from {name}: {fetched}")
+
+          print(f"\n[TOTAL] {len(all_examples)} adversarial examples collected")
+
+          if not all_examples:
+            print("[ERROR] No examples fetched — aborting")
+            exit(1)
+
+          # -------------------------------------------------------------------
+          # Write JSONL
+          # -------------------------------------------------------------------
+          tmp_dir  = tempfile.mkdtemp()
+          data_dir = os.path.join(tmp_dir, "data")
+          os.makedirs(data_dir, exist_ok=True)
+
+          jsonl_path = os.path.join(data_dir, "class_02_adversarial_probe.jsonl")
+          with open(jsonl_path, "w", encoding="utf-8") as f:
+            for ex in all_examples:
+              f.write(json.dumps(ex, ensure_ascii=False) + "\n")
+
+          print(f"[WRITE] {len(all_examples)} examples written to class_02_adversarial_probe.jsonl")
+
+          # -------------------------------------------------------------------
+          # Update progress.json — set class 02 count accurately
+          # -------------------------------------------------------------------
+          try:
+            dl = hf_hub_download(
+              repo_id=REPO, filename="progress.json",
+              repo_type="dataset", token=TOKEN, force_download=True,
+            )
+            with open(dl, "r", encoding="utf-8") as f:
+              state = json.load(f)
+          except Exception:
+            print("[WARN] Could not load progress.json — skipping state update")
+            state = None
+
+          if state:
+            state["class_counts"]["2"]   = len(all_examples)
+            state["class_complete"]["2"] = len(all_examples) >= TARGET
+            # Recalculate total
+            state["total_generated"] = sum(state["class_counts"].values())
+            progress_path = os.path.join(tmp_dir, "progress.json")
+            with open(progress_path, "w", encoding="utf-8") as f:
+              json.dump(state, f, indent=2)
+            print(f"[STATE] Updated — class 02: {len(all_examples)} examples, "
+                  f"complete: {state['class_complete']['2']}")
+
+          # -------------------------------------------------------------------
+          # Push everything in one commit
+          # -------------------------------------------------------------------
+          print("\n[PUSH] Uploading to HuggingFace...")
+          api.upload_folder(
+            folder_path=tmp_dir,
+            repo_id=REPO,
+            repo_type="dataset",
+            commit_message=f"Fill adversarial class: {len(all_examples)} examples from verified HF datasets",
+          )
+
+          shutil.rmtree(tmp_dir, ignore_errors=True)
+          print(f"\n[DONE] ✓ Class 02 filled with {len(all_examples)} examples")
+          print(f"[DONE] Sources: neuralchemy, Harelix, yanismiraoui, reshabhs, rubend18")
+          EOF
